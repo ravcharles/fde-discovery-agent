@@ -34,9 +34,12 @@ from app.app_utils.schemas import (
     DiscoveryState
 )
 
+import asyncio
+
 # --- LLM Client ---
 client = genai.Client()
 MODEL_NAME = "gemini-2.5-flash"
+PRO_MODEL_NAME = "gemini-2.5-pro"
 
 
 # --- Helper ---
@@ -105,7 +108,8 @@ Adhere to these style instructions for the first question (only if target_mode i
 - Begin the message by introducing yourself as their AI Forward Deployed Engineer discovery partner. Welcomingly invite them to collaborate on mapping out their project's objectives and aligning on a clear, refined problem statement they can agree on.
 - Following the introduction, ask exactly one targeted, natural first question to start exploring their main goals or business objectives. Keep it brief and friendly."""
 
-    response = client.models.generate_content(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -294,7 +298,8 @@ Adhere to these styling instructions for formulation of the next question:
 - Ask exactly one targeted question at a time. Do not compile checklists or multi-part questions (e.g., do not ask 'For timeline, do you have target date? Also, are there dependencies?'). Keep it simple and human-like."""
 
 
-    response = client.models.generate_content(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -308,7 +313,8 @@ Adhere to these styling instructions for formulation of the next question:
     try:
         data = DiscoveryResponse.model_validate_json(response.text)
     except Exception:
-        fallback_response = client.models.generate_content(
+        fallback_response = await asyncio.to_thread(
+            client.models.generate_content,
             model=MODEL_NAME,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -406,7 +412,8 @@ Customer response: "{user_msg}"
 
 Conform your output to the AgreementResponse schema."""
 
-    response = client.models.generate_content(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -501,7 +508,8 @@ Generate the initial draft of the Why Change Planner:
 Also, formulate the first targeted question to ask the customer about their previous approach or current setup (status quo) to understand why they want to change. Do not introduce yourself or use welcome greetings (since the conversation is already ongoing and we just aligned on the problem statement). Instead, transition seamlessly using a brief, natural segue (e.g., acknowledging the alignment we just reached and inviting them to explore the underlying trends or setup) before asking the question directly. Keep the tone warm and collaborative.
 Conform to the WhyChangeLoopResponse schema."""
 
-    response = client.models.generate_content(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -515,7 +523,8 @@ Conform to the WhyChangeLoopResponse schema."""
     try:
         data = WhyChangeLoopResponse.model_validate_json(response.text)
     except Exception:
-        fallback_response = client.models.generate_content(
+        fallback_response = await asyncio.to_thread(
+            client.models.generate_content,
             model=MODEL_NAME,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -654,7 +663,8 @@ Adhere to these styling instructions:
 
 Generate response conforming to the WhyChangeLoopResponse schema."""
 
-    response = client.models.generate_content(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -668,7 +678,8 @@ Generate response conforming to the WhyChangeLoopResponse schema."""
     try:
         data = WhyChangeLoopResponse.model_validate_json(response.text)
     except Exception:
-        fallback_response = client.models.generate_content(
+        fallback_response = await asyncio.to_thread(
+            client.models.generate_content,
             model=MODEL_NAME,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -755,7 +766,8 @@ Customer response: "{user_msg}"
 
 Conform your output to the AgreementResponse schema."""
 
-    response = client.models.generate_content(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -867,8 +879,9 @@ Format the output cleanly using structured subheadings and markdown tables to ma
 
     logging.info("Intent: Compile ALIGN discovery reasoning summary and Why Change Pitch")
     
-    response = client.models.generate_content(
-        model=MODEL_NAME,
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=PRO_MODEL_NAME,
         contents=prompt
     )
     
