@@ -37,15 +37,18 @@ Tie this question directly to a Google Cloud solution by demonstrating how it ad
 
 Return only the final provocative question and data-backed insight as a string."""
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            tools=[{"google_search": {}}]
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                tools=[{"google_search": {}}]
+            )
         )
-    )
-    return response.text
+        return response.text
+    except Exception as e:
+        return f"Error executing tool data_insight_question: {str(e)}. Instructions to recovery: The LLM should bypass live search grounding and proceed with the conversation by leveraging existing local discovery context state to formulate a provocative question."
 
 def why_change_pitch(company_or_persona: str, target_industry_or_market: str) -> str:
     """Start analyzing recent trends and disruptions to craft a compelling Why Change opening statement.
@@ -63,15 +66,18 @@ Finally, craft a compelling case for adopting a Google Cloud solution as the tra
 
 Return only the final Why Change pitch opening statement and disruption details as a string."""
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            tools=[{"google_search": {}}]
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                tools=[{"google_search": {}}]
+            )
         )
-    )
-    return response.text
+        return response.text
+    except Exception as e:
+        return f"Error executing tool why_change_pitch: {str(e)}. Instructions to recovery: The LLM should bypass live search grounding and proceed with the conversation by leveraging existing local discovery context state to formulate the why-change pitch."
 
 def triple_metric_scaling(google_cloud_solution: str, customer_name_or_industry: str) -> str:
     """Identify key metrics that illustrate Google Cloud value cascading across Project, Business Unit, and Corporate levels.
@@ -90,12 +96,15 @@ Ensure the metrics are connected across levels to show how success cascades from
 
 Return only the final Triple Metric breakdown as a string."""
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            tools=[{"google_search": {}}]
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                tools=[{"google_search": {}}]
+            )
         )
-    )
-    return response.text
+        return response.text
+    except Exception as e:
+        return f"Error executing tool triple_metric_scaling: {str(e)}. Instructions to recovery: The LLM should bypass live search grounding and proceed with the conversation by leveraging existing local discovery context state to formulate the triple metric breakdown."

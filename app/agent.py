@@ -21,6 +21,8 @@ from google.adk.apps import App
 from google.adk.events.event import Event
 from google.adk.events.request_input import RequestInput
 from app.app_utils.skills import data_insight_question, why_change_pitch, triple_metric_scaling
+import logging
+from app.app_utils.telemetry import redact_pii
 
 from app.app_utils.schemas import (
     TriageResponse,
@@ -38,6 +40,23 @@ MODEL_NAME = "gemini-2.5-flash"
 
 
 # --- Helper ---
+def check_security_guardrails(text: str) -> str | None:
+    """Checks user inputs for potential security violations or prompt injections.
+    Returns a recovery error message if a violation is detected, otherwise None.
+    """
+    if not text:
+        return None
+    # 1. DOS Protection: Length Check
+    if len(text) > 10000:
+        return "Input exceeds maximum allowed length of 10,000 characters. Please provide a shorter message."
+    # 2. Basic Prompt Injection/Jailbreak Checks
+    jailbreak_keywords = ["ignore previous instructions", "system override", "bypass restrictions", "you are now in developer mode"]
+    lower_text = text.lower()
+    for kw in jailbreak_keywords:
+        if kw in lower_text:
+            return "Security violation: Potential prompt injection attempt detected. Suggestion: Reset your message and stay focused on the cloud discovery scope."
+    return None
+
 def to_event(text: str) -> Event:
     content = types.Content(role="model", parts=[types.Part.from_text(text=text)])
     return Event(
@@ -50,10 +69,19 @@ def to_event(text: str) -> Event:
 @node
 async def triage_and_draft(ctx: Context, node_input: str):
     state = ctx.state
+    node_input = redact_pii(node_input)
+    logging.info(f"Intent: Triage customer query and categorize mode. Input: {node_input}")
+    
+    guardrail_warn = check_security_guardrails(node_input)
+    if guardrail_warn:
+        ctx.route = "unrelated"
+        logging.warning(f"Outcome: Security violation detected: {guardrail_warn}")
+        return to_event(guardrail_warn)
     
     # Replay optimization: skip LLM call if triage has already executed and set state
     if state.get("triage_done"):
         ctx.route = "related"
+        logging.info("Outcome: Replay skip, routing to related mode discovery")
         return None
     
     prompt = f"""You are a Google Cloud AI Forward Deployed Engineer (FDE).
@@ -92,7 +120,9 @@ Adhere to these style instructions for the first question (only if target_mode i
     if not data.is_related:
         state["triage_done"] = True
         ctx.route = "unrelated"
-        return to_event(data.polite_decline)
+        declined_text = redact_pii(data.polite_decline)
+        logging.info(f"Outcome: Query is unrelated, returned polite decline: {declined_text}")
+        return to_event(declined_text)
     
     state["is_related"] = True
     state["triage_done"] = True
@@ -100,15 +130,18 @@ Adhere to these style instructions for the first question (only if target_mode i
     # We always start in discovery mode to align on the problem statement first
     ctx.route = "related"
     state["mode"] = "discovery"
-    state["draft_context"] = data.general_draft
+    state["draft_context"] = redact_pii(data.general_draft)
     state["draft_quantify"] = "TBD"
     state["draft_scope"] = "TBD"
-    state["next_question"] = data.first_question
+    
+    first_q = redact_pii(data.first_question)
+    state["next_question"] = first_q
     state["question_count"] = 1
-    state["questions_asked"] = [data.first_question]
+    state["questions_asked"] = [first_q]
     state["question_types"] = ["Background"]
     state["question_categories"] = ["Goals"]
         
+    logging.info(f"Outcome: Initialized discovery mode, first question: {first_q}")
     return None
 
 @node
@@ -176,8 +209,17 @@ async def discovery_loop(ctx: Context, node_input: types.Content | str):
     count = state.get("question_count", 0)
     
     interrupt_id = f"question_{count}"
-    user_msg = _get_user_input(ctx, interrupt_id, node_input)
-
+    raw_user_msg = _get_user_input(ctx, interrupt_id, node_input)
+    user_msg = redact_pii(raw_user_msg)
+    
+    logging.info(f"Intent: Refine discovery draft and ask next targeted question. Input: {user_msg}")
+    
+    guardrail_warn = check_security_guardrails(user_msg)
+    if guardrail_warn:
+        ctx.route = "ask_question"
+        logging.warning(f"Outcome: Security warning inside discovery loop: {guardrail_warn}")
+        state["next_question"] = guardrail_warn
+        return None
         
     answers = state.get("answers_received", [])
     answers.append(user_msg)
@@ -286,10 +328,10 @@ Adhere to these styling instructions for formulation of the next question:
     accuracies.append(data.customer_accuracy)
     state["accuracy_assessments"] = accuracies
     
-    # Save refined draft to state
-    state["draft_context"] = data.refined_draft.context
-    state["draft_quantify"] = data.refined_draft.quantify
-    state["draft_scope"] = data.refined_draft.scope
+    # Save refined draft to state (with PII scrubbing)
+    state["draft_context"] = redact_pii(data.refined_draft.context)
+    state["draft_quantify"] = redact_pii(data.refined_draft.quantify)
+    state["draft_scope"] = redact_pii(data.refined_draft.scope)
     
     # Clear refinement override once the user message has been processed
     is_refining = state.get("is_refining", False)
@@ -297,13 +339,15 @@ Adhere to these styling instructions for formulation of the next question:
     
     if data.finalize or (count >= 15 and not is_refining):
         ctx.route = "finalize"
+        logging.info(f"Outcome: Discovery finalized. Context: {state['draft_context']}, Quantify: {state['draft_quantify']}, Scope: {state['draft_scope']}")
         return None
     
-    # Continue discovery loop
-    state["next_question"] = data.next_question
+    # Continue discovery loop (with PII scrubbing)
+    scrubbed_q = redact_pii(data.next_question)
+    state["next_question"] = scrubbed_q
     state["question_count"] = count + 1
     
-    questions.append(data.next_question)
+    questions.append(scrubbed_q)
     state["questions_asked"] = questions
     
     q_types = state.get("question_types", [])
@@ -315,6 +359,7 @@ Adhere to these styling instructions for formulation of the next question:
     state["question_categories"] = q_categories
     
     ctx.route = "ask_question"
+    logging.info(f"Outcome: Discovery ongoing. Next question ({state['question_count']}): {scrubbed_q}")
     return None
 
 @node
@@ -340,8 +385,21 @@ async def get_agreement(ctx: Context, node_input: types.Content | str | None = N
 async def process_agreement(ctx: Context, node_input: types.Content | str):
     state = ctx.state
     
-    user_msg = _get_user_input(ctx, "agreement", node_input)
-
+    raw_user_msg = _get_user_input(ctx, "agreement", node_input)
+    user_msg = redact_pii(raw_user_msg)
+    
+    logging.info(f"Intent: Parse customer agreement on Discovery Problem Statement. Input: {user_msg}")
+    
+    guardrail_warn = check_security_guardrails(user_msg)
+    if guardrail_warn:
+        ctx.route = "disagreed"
+        logging.warning(f"Outcome: Security warning inside discovery agreement: {guardrail_warn}")
+        state["is_refining"] = True
+        state["next_question"] = guardrail_warn
+        questions = state.get("questions_asked", [])
+        questions.append(guardrail_warn)
+        state["questions_asked"] = questions
+        return to_event("Security warning: Potential injection attempt. Please re-enter your agreement or feedback.")
         
     prompt = f"""Analyze the customer's response to the problem statement agreement request.
 Customer response: "{user_msg}"
@@ -363,6 +421,7 @@ Conform your output to the AgreementResponse schema."""
     if data.agreed:
         ctx.route = "agreed"
         state["confirmed"] = True
+        logging.info("Outcome: Problem Statement agreed successfully. Transitioning to Why Change phase.")
         return None
     
     # Handle edits/feedback: route back to discovery loop
@@ -373,12 +432,15 @@ Conform your output to the AgreementResponse schema."""
         ctx.route = "agreed"
         state["confirmed"] = True
         force_msg = "We have completed several refinement rounds. Let's lock in this version as our working problem statement and transition to the Why Change phase."
+        logging.info("Outcome: Agreement attempts exceeded cap. Forcing confirmation and routing to Why Change.")
         return to_event(force_msg)
         
     state["is_refining"] = True
     count = state.get("question_count", 0) + 1
     state["question_count"] = count
-    state["next_question"] = f"Let's refine the draft based on your feedback: '{data.edits}'. Can you provide more details about this change?"
+    
+    scrubbed_edits = redact_pii(data.edits)
+    state["next_question"] = f"Let's refine the draft based on your feedback: '{scrubbed_edits}'. Can you provide more details about this change?"
     
     questions = state.get("questions_asked", [])
     questions.append(state["next_question"])
@@ -386,15 +448,18 @@ Conform your output to the AgreementResponse schema."""
     
     ctx.route = "disagreed"
     disagree_msg = "Understood. Let's adjust the draft based on your feedback."
+    logging.info(f"Outcome: Disagreed. Routing back to discovery loop. Edits: {scrubbed_edits}")
     return to_event(disagree_msg)
 
 @node
 async def why_change_start_node(ctx: Context):
     state = ctx.state
+    logging.info("Intent: Seeding Why Change Planner and starting phase transition")
     state["mode"] = "why_change"
     
     # Replay optimization: skip initial why change planner draft LLM call if it has already run
     if state.get("wc_target") and state.get("wc_target") != "TBD":
+        logging.info("Outcome: Replay skip, why_change already initialized")
         return None
         
     state["wc_question_count"] = 1
@@ -461,22 +526,24 @@ Conform to the WhyChangeLoopResponse schema."""
         )
         data = WhyChangeLoopResponse.model_validate_json(fallback_response.text)
     
-    # Save initial planner
-    state["wc_business_goals"] = data.refined_planner.business_goals
-    state["wc_known_needs"] = data.refined_planner.known_needs
-    state["wc_unconsidered_needs"] = data.refined_planner.unconsidered_needs
-    state["wc_trends_changes"] = data.refined_planner.trends_changes
-    state["wc_previous_approach"] = data.refined_planner.previous_approach
-    state["wc_consequences"] = data.refined_planner.consequences
-    state["wc_new_way"] = data.refined_planner.new_way
-    state["wc_likely_outcomes_project"] = data.refined_planner.likely_outcomes_project
-    state["wc_likely_outcomes_business_unit"] = data.refined_planner.likely_outcomes_business_unit
-    state["wc_likely_outcomes_corporate"] = data.refined_planner.likely_outcomes_corporate
-    state["wc_target"] = data.refined_planner.target
+    # Save initial planner (with PII scrubbing)
+    state["wc_business_goals"] = redact_pii(data.refined_planner.business_goals)
+    state["wc_known_needs"] = redact_pii(data.refined_planner.known_needs)
+    state["wc_unconsidered_needs"] = redact_pii(data.refined_planner.unconsidered_needs)
+    state["wc_trends_changes"] = redact_pii(data.refined_planner.trends_changes)
+    state["wc_previous_approach"] = redact_pii(data.refined_planner.previous_approach)
+    state["wc_consequences"] = redact_pii(data.refined_planner.consequences)
+    state["wc_new_way"] = redact_pii(data.refined_planner.new_way)
+    state["wc_likely_outcomes_project"] = redact_pii(data.refined_planner.likely_outcomes_project)
+    state["wc_likely_outcomes_business_unit"] = redact_pii(data.refined_planner.likely_outcomes_business_unit)
+    state["wc_likely_outcomes_corporate"] = redact_pii(data.refined_planner.likely_outcomes_corporate)
+    state["wc_target"] = redact_pii(data.refined_planner.target)
     
-    state["wc_next_question"] = data.next_question
+    scrubbed_q = redact_pii(data.next_question)
+    state["wc_next_question"] = scrubbed_q
     
     ctx.route = "ask"
+    logging.info(f"Outcome: Why Change initialized. Target: {state['wc_target']}, First Question: {scrubbed_q}")
     return None
 
 @node
@@ -497,7 +564,17 @@ async def why_change_loop(ctx: Context, node_input: types.Content | str):
     count = state.get("wc_question_count", 1)
     
     interrupt_id = f"wc_question_{count}"
-    user_msg = _get_user_input(ctx, interrupt_id, node_input)
+    raw_user_msg = _get_user_input(ctx, interrupt_id, node_input)
+    user_msg = redact_pii(raw_user_msg)
+    
+    logging.info(f"Intent: Refine Why Change Planner draft and ask next targeted question. Input: {user_msg}")
+    
+    guardrail_warn = check_security_guardrails(user_msg)
+    if guardrail_warn:
+        ctx.route = "ask"
+        logging.warning(f"Outcome: Security warning inside why change loop: {guardrail_warn}")
+        state["wc_next_question"] = guardrail_warn
+        return None
     
     answers = state.get("wc_answers_received", [])
     answers.append(user_msg)
@@ -602,18 +679,18 @@ Generate response conforming to the WhyChangeLoopResponse schema."""
         )
         data = WhyChangeLoopResponse.model_validate_json(fallback_response.text)
     
-    # Update state
-    state["wc_business_goals"] = data.refined_planner.business_goals
-    state["wc_known_needs"] = data.refined_planner.known_needs
-    state["wc_unconsidered_needs"] = data.refined_planner.unconsidered_needs
-    state["wc_trends_changes"] = data.refined_planner.trends_changes
-    state["wc_previous_approach"] = data.refined_planner.previous_approach
-    state["wc_consequences"] = data.refined_planner.consequences
-    state["wc_new_way"] = data.refined_planner.new_way
-    state["wc_likely_outcomes_project"] = data.refined_planner.likely_outcomes_project
-    state["wc_likely_outcomes_business_unit"] = data.refined_planner.likely_outcomes_business_unit
-    state["wc_likely_outcomes_corporate"] = data.refined_planner.likely_outcomes_corporate
-    state["wc_target"] = data.refined_planner.target
+    # Update state (with PII scrubbing)
+    state["wc_business_goals"] = redact_pii(data.refined_planner.business_goals)
+    state["wc_known_needs"] = redact_pii(data.refined_planner.known_needs)
+    state["wc_unconsidered_needs"] = redact_pii(data.refined_planner.unconsidered_needs)
+    state["wc_trends_changes"] = redact_pii(data.refined_planner.trends_changes)
+    state["wc_previous_approach"] = redact_pii(data.refined_planner.previous_approach)
+    state["wc_consequences"] = redact_pii(data.refined_planner.consequences)
+    state["wc_new_way"] = redact_pii(data.refined_planner.new_way)
+    state["wc_likely_outcomes_project"] = redact_pii(data.refined_planner.likely_outcomes_project)
+    state["wc_likely_outcomes_business_unit"] = redact_pii(data.refined_planner.likely_outcomes_business_unit)
+    state["wc_likely_outcomes_corporate"] = redact_pii(data.refined_planner.likely_outcomes_corporate)
+    state["wc_target"] = redact_pii(data.refined_planner.target)
     
     biases = state.get("wc_primary_biases", [])
     biases.append(data.primary_bias)
@@ -624,11 +701,14 @@ Generate response conforming to the WhyChangeLoopResponse schema."""
     
     if data.finalize or (count >= 12 and not is_refining):
         ctx.route = "finalize"
+        logging.info(f"Outcome: Why Change loop finalized. Target: {state['wc_target']}, Goals: {state['wc_business_goals']}, Consequences: {state['wc_consequences']}, Outcomes: {state['wc_likely_outcomes_corporate']}")
         return None
         
-    state["wc_next_question"] = data.next_question
+    scrubbed_q = redact_pii(data.next_question)
+    state["wc_next_question"] = scrubbed_q
     state["wc_question_count"] = count + 1
     ctx.route = "ask"
+    logging.info(f"Outcome: Why Change loop ongoing. Next question ({state['wc_question_count']}): {scrubbed_q}")
     return None
 
 @node
@@ -657,7 +737,18 @@ async def why_change_agreement(ctx: Context, node_input: types.Content | str | N
 @node
 async def process_wc_agreement(ctx: Context, node_input: types.Content | str):
     state = ctx.state
-    user_msg = _get_user_input(ctx, "wc_agreement", node_input)
+    raw_user_msg = _get_user_input(ctx, "wc_agreement", node_input)
+    user_msg = redact_pii(raw_user_msg)
+    
+    logging.info(f"Intent: Parse customer agreement on Why Change Planner. Input: {user_msg}")
+    
+    guardrail_warn = check_security_guardrails(user_msg)
+    if guardrail_warn:
+        ctx.route = "disagreed"
+        logging.warning(f"Outcome: Security warning inside why change agreement: {guardrail_warn}")
+        state["is_refining"] = True
+        state["wc_next_question"] = guardrail_warn
+        return to_event("Security warning: Potential injection attempt. Please re-enter your agreement or feedback.")
     
     prompt = f"""Analyze the customer's response to the Why Change Planner agreement request.
 Customer response: "{user_msg}"
@@ -679,6 +770,7 @@ Conform your output to the AgreementResponse schema."""
     if data.agreed:
         ctx.route = "agreed"
         state["wc_confirmed"] = True
+        logging.info("Outcome: Why Change Planner agreed successfully. Transitioning to final summary.")
         return None
     
     # Handle feedback/edits: route back to why change loop
@@ -689,14 +781,18 @@ Conform your output to the AgreementResponse schema."""
         ctx.route = "agreed"
         state["wc_confirmed"] = True
         force_msg = "We have completed several refinement rounds. Let's lock in this version as our finalized Why Change Planner and prepare the reasoning summary."
+        logging.info("Outcome: Why Change agreement attempts exceeded cap. Forcing confirmation and routing to final summary.")
         return to_event(force_msg)
         
     state["is_refining"] = True
     count = state.get("wc_question_count", 1) + 1
     state["wc_question_count"] = count
-    state["wc_next_question"] = f"Let's refine the Why Change Planner based on your feedback: '{data.edits}'. Can you tell me more about this adjustment?"
+    
+    scrubbed_edits = redact_pii(data.edits)
+    state["wc_next_question"] = f"Let's refine the Why Change Planner based on your feedback: '{scrubbed_edits}'. Can you tell me more about this adjustment?"
     
     ctx.route = "disagreed"
+    logging.info(f"Outcome: Disagreed. Routing back to why change loop. Edits: {scrubbed_edits}")
     return to_event("Understood. Let's adjust the Why Change Planner based on your feedback.")
 
 @node
@@ -769,6 +865,8 @@ Your output must be organized around the **ALIGN** discovery stages:
 
 Format the output cleanly using structured subheadings and markdown tables to make it look premium, structured, and professional."""
 
+    logging.info("Intent: Compile ALIGN discovery reasoning summary and Why Change Pitch")
+    
     response = client.models.generate_content(
         model=MODEL_NAME,
         contents=prompt
@@ -791,7 +889,7 @@ Format the output cleanly using structured subheadings and markdown tables to ma
 * **Likely Outcomes (Corporate)**: {state.get('wc_likely_outcomes_corporate')}
 * **Active Status Quo Biases Addressed**: {biases_identified}"""
 
-    summary = f"""Great! We have aligned on the problem statement using the REALIGN framework.
+    raw_summary = f"""Great! We have aligned on the problem statement using the REALIGN framework.
 
 Next Steps: I will prepare a proposal outlining our proposed architecture and timeline, and schedule a review call next week.
 
@@ -803,6 +901,8 @@ Thank you for the discovery session. Looking forward to our next meeting!
 
 [Session Status: Concluded Successfully]"""
 
+    summary = redact_pii(raw_summary)
+    logging.info("Outcome: Full Discovery report card compiled, session concluded successfully")
     return to_event(summary)
 
 # --- Workflow Definition ---

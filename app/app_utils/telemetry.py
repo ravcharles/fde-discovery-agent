@@ -72,3 +72,20 @@ def setup_agent_engine_telemetry() -> None:
 
     _, project_id = google.auth.default()
     _default_instrumentor_builder(project_id, enable_tracing=True, enable_logging=True)
+
+
+def redact_pii(text: str) -> str:
+    """Redacts common PII (emails, phone numbers, IP addresses) from text to protect confidentiality."""
+    if not text:
+        return text
+    import re
+    # Redact Emails
+    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+    text = re.sub(email_pattern, "[EMAIL_REDACTED]", text)
+    # Redact Phone Numbers
+    phone_pattern = r'\+?\b(?:\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+    text = re.sub(phone_pattern, "[PHONE_REDACTED]", text)
+    # Redact IP Addresses
+    ip_pattern = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+    text = re.sub(ip_pattern, "[IP_REDACTED]", text)
+    return text
