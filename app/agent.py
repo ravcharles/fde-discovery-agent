@@ -60,6 +60,20 @@ def check_security_guardrails(text: str) -> str | None:
             return "Security violation: Potential prompt injection attempt detected. Suggestion: Reset your message and stay focused on the cloud discovery scope."
     return None
 
+import json
+
+def log_structured(severity: str, event_type: str, details: dict):
+    """Logs a structured JSON message for cloud logging consumption."""
+    log_payload = {
+        "severity": severity,
+        "event_type": event_type,
+        **details
+    }
+    logging.getLogger("fde-discovery-agent").log(
+        getattr(logging, severity.upper(), logging.INFO),
+        json.dumps(log_payload)
+    )
+
 def to_event(text: str) -> Event:
     content = types.Content(role="model", parts=[types.Part.from_text(text=text)])
     return Event(
@@ -73,18 +87,18 @@ def to_event(text: str) -> Event:
 async def triage_and_draft(ctx: Context, node_input: str):
     state = ctx.state
     node_input = redact_pii(node_input)
-    logging.info(f"Intent: Triage customer query and categorize mode. Input: {node_input}")
+    log_structured("INFO", "intent", {"node": "triage_and_draft", "action": "triage_query", "input": node_input})
     
     guardrail_warn = check_security_guardrails(node_input)
     if guardrail_warn:
         ctx.route = "unrelated"
-        logging.warning(f"Outcome: Security violation detected: {guardrail_warn}")
+        log_structured("WARNING", "security_guardrail", {"node": "triage_and_draft", "action": "block_query", "warning": guardrail_warn})
         return to_event(guardrail_warn)
     
     # Replay optimization: skip LLM call if triage has already executed and set state
     if state.get("triage_done"):
         ctx.route = "related"
-        logging.info("Outcome: Replay skip, routing to related mode discovery")
+        log_structured("INFO", "outcome", {"node": "triage_and_draft", "action": "replay_skip", "route": ctx.route})
         return None
     
     prompt = f"""You are a Google Cloud AI Forward Deployed Engineer (FDE).
@@ -125,7 +139,7 @@ Adhere to these style instructions for the first question (only if target_mode i
         state["triage_done"] = True
         ctx.route = "unrelated"
         declined_text = redact_pii(data.polite_decline)
-        logging.info(f"Outcome: Query is unrelated, returned polite decline: {declined_text}")
+        log_structured("INFO", "outcome", {"node": "triage_and_draft", "action": "query_unrelated", "polite_decline": declined_text})
         return to_event(declined_text)
     
     state["is_related"] = True
@@ -145,7 +159,7 @@ Adhere to these style instructions for the first question (only if target_mode i
     state["question_types"] = ["Background"]
     state["question_categories"] = ["Goals"]
         
-    logging.info(f"Outcome: Initialized discovery mode, first question: {first_q}")
+    log_structured("INFO", "outcome", {"node": "triage_and_draft", "action": "initialize_discovery", "first_question": first_q})
     return None
 
 @node
@@ -216,12 +230,12 @@ async def discovery_loop(ctx: Context, node_input: types.Content | str):
     raw_user_msg = _get_user_input(ctx, interrupt_id, node_input)
     user_msg = redact_pii(raw_user_msg)
     
-    logging.info(f"Intent: Refine discovery draft and ask next targeted question. Input: {user_msg}")
+    log_structured("INFO", "intent", {"node": "discovery_loop", "action": "refine_discovery", "input": user_msg})
     
     guardrail_warn = check_security_guardrails(user_msg)
     if guardrail_warn:
         ctx.route = "ask_question"
-        logging.warning(f"Outcome: Security warning inside discovery loop: {guardrail_warn}")
+        log_structured("WARNING", "security_guardrail", {"node": "discovery_loop", "action": "block_input", "warning": guardrail_warn})
         state["next_question"] = guardrail_warn
         return None
         
@@ -345,7 +359,13 @@ Adhere to these styling instructions for formulation of the next question:
     
     if data.finalize or (count >= 15 and not is_refining):
         ctx.route = "finalize"
-        logging.info(f"Outcome: Discovery finalized. Context: {state['draft_context']}, Quantify: {state['draft_quantify']}, Scope: {state['draft_scope']}")
+        log_structured("INFO", "outcome", {
+            "node": "discovery_loop",
+            "action": "finalize_discovery",
+            "draft_context": state["draft_context"],
+            "draft_quantify": state["draft_quantify"],
+            "draft_scope": state["draft_scope"]
+        })
         return None
     
     # Continue discovery loop (with PII scrubbing)
@@ -365,7 +385,12 @@ Adhere to these styling instructions for formulation of the next question:
     state["question_categories"] = q_categories
     
     ctx.route = "ask_question"
-    logging.info(f"Outcome: Discovery ongoing. Next question ({state['question_count']}): {scrubbed_q}")
+    log_structured("INFO", "outcome", {
+        "node": "discovery_loop",
+        "action": "continue_discovery",
+        "question_count": state["question_count"],
+        "next_question": scrubbed_q
+    })
     return None
 
 @node
@@ -394,12 +419,12 @@ async def process_agreement(ctx: Context, node_input: types.Content | str):
     raw_user_msg = _get_user_input(ctx, "agreement", node_input)
     user_msg = redact_pii(raw_user_msg)
     
-    logging.info(f"Intent: Parse customer agreement on Discovery Problem Statement. Input: {user_msg}")
+    log_structured("INFO", "intent", {"node": "process_agreement", "action": "parse_agreement", "input": user_msg})
     
     guardrail_warn = check_security_guardrails(user_msg)
     if guardrail_warn:
         ctx.route = "disagreed"
-        logging.warning(f"Outcome: Security warning inside discovery agreement: {guardrail_warn}")
+        log_structured("WARNING", "security_guardrail", {"node": "process_agreement", "action": "block_agreement", "warning": guardrail_warn})
         state["is_refining"] = True
         state["next_question"] = guardrail_warn
         questions = state.get("questions_asked", [])
@@ -428,7 +453,7 @@ Conform your output to the AgreementResponse schema."""
     if data.agreed:
         ctx.route = "agreed"
         state["confirmed"] = True
-        logging.info("Outcome: Problem Statement agreed successfully. Transitioning to Why Change phase.")
+        log_structured("INFO", "outcome", {"node": "process_agreement", "action": "agreement_success", "route": ctx.route})
         return None
     
     # Handle edits/feedback: route back to discovery loop
@@ -439,7 +464,7 @@ Conform your output to the AgreementResponse schema."""
         ctx.route = "agreed"
         state["confirmed"] = True
         force_msg = "We have completed several refinement rounds. Let's lock in this version as our working problem statement and transition to the Why Change phase."
-        logging.info("Outcome: Agreement attempts exceeded cap. Forcing confirmation and routing to Why Change.")
+        log_structured("INFO", "outcome", {"node": "process_agreement", "action": "agreement_max_attempts_exceeded", "route": ctx.route})
         return to_event(force_msg)
         
     state["is_refining"] = True
@@ -455,18 +480,18 @@ Conform your output to the AgreementResponse schema."""
     
     ctx.route = "disagreed"
     disagree_msg = "Understood. Let's adjust the draft based on your feedback."
-    logging.info(f"Outcome: Disagreed. Routing back to discovery loop. Edits: {scrubbed_edits}")
+    log_structured("INFO", "outcome", {"node": "process_agreement", "action": "agreement_disagreed", "edits": scrubbed_edits, "route": ctx.route})
     return to_event(disagree_msg)
 
 @node
 async def why_change_start_node(ctx: Context):
     state = ctx.state
-    logging.info("Intent: Seeding Why Change Planner and starting phase transition")
+    log_structured("INFO", "intent", {"node": "why_change_start_node", "action": "seed_why_change_planner"})
     state["mode"] = "why_change"
     
     # Replay optimization: skip initial why change planner draft LLM call if it has already run
     if state.get("wc_target") and state.get("wc_target") != "TBD":
-        logging.info("Outcome: Replay skip, why_change already initialized")
+        log_structured("INFO", "outcome", {"node": "why_change_start_node", "action": "replay_skip", "route": ctx.route})
         return None
         
     state["wc_question_count"] = 1
@@ -552,7 +577,13 @@ Conform to the WhyChangeLoopResponse schema."""
     state["wc_next_question"] = scrubbed_q
     
     ctx.route = "ask"
-    logging.info(f"Outcome: Why Change initialized. Target: {state['wc_target']}, First Question: {scrubbed_q}")
+    log_structured("INFO", "outcome", {
+        "node": "why_change_start_node",
+        "action": "why_change_initialized",
+        "target": state["wc_target"],
+        "first_question": scrubbed_q,
+        "route": ctx.route
+    })
     return None
 
 @node
@@ -576,12 +607,12 @@ async def why_change_loop(ctx: Context, node_input: types.Content | str):
     raw_user_msg = _get_user_input(ctx, interrupt_id, node_input)
     user_msg = redact_pii(raw_user_msg)
     
-    logging.info(f"Intent: Refine Why Change Planner draft and ask next targeted question. Input: {user_msg}")
+    log_structured("INFO", "intent", {"node": "why_change_loop", "action": "refine_why_change", "input": user_msg})
     
     guardrail_warn = check_security_guardrails(user_msg)
     if guardrail_warn:
         ctx.route = "ask"
-        logging.warning(f"Outcome: Security warning inside why change loop: {guardrail_warn}")
+        log_structured("WARNING", "security_guardrail", {"node": "why_change_loop", "action": "block_input", "warning": guardrail_warn})
         state["wc_next_question"] = guardrail_warn
         return None
     
@@ -712,14 +743,26 @@ Generate response conforming to the WhyChangeLoopResponse schema."""
     
     if data.finalize or (count >= 12 and not is_refining):
         ctx.route = "finalize"
-        logging.info(f"Outcome: Why Change loop finalized. Target: {state['wc_target']}, Goals: {state['wc_business_goals']}, Consequences: {state['wc_consequences']}, Outcomes: {state['wc_likely_outcomes_corporate']}")
+        log_structured("INFO", "outcome", {
+            "node": "why_change_loop",
+            "action": "finalize_why_change",
+            "target": state["wc_target"],
+            "goals": state["wc_business_goals"],
+            "consequences": state["wc_consequences"],
+            "outcomes": state["wc_likely_outcomes_corporate"]
+        })
         return None
         
     scrubbed_q = redact_pii(data.next_question)
     state["wc_next_question"] = scrubbed_q
     state["wc_question_count"] = count + 1
     ctx.route = "ask"
-    logging.info(f"Outcome: Why Change loop ongoing. Next question ({state['wc_question_count']}): {scrubbed_q}")
+    log_structured("INFO", "outcome", {
+        "node": "why_change_loop",
+        "action": "continue_why_change",
+        "question_count": state["wc_question_count"],
+        "next_question": scrubbed_q
+    })
     return None
 
 @node
@@ -751,12 +794,12 @@ async def process_wc_agreement(ctx: Context, node_input: types.Content | str):
     raw_user_msg = _get_user_input(ctx, "wc_agreement", node_input)
     user_msg = redact_pii(raw_user_msg)
     
-    logging.info(f"Intent: Parse customer agreement on Why Change Planner. Input: {user_msg}")
+    log_structured("INFO", "intent", {"node": "process_wc_agreement", "action": "parse_wc_agreement", "input": user_msg})
     
     guardrail_warn = check_security_guardrails(user_msg)
     if guardrail_warn:
         ctx.route = "disagreed"
-        logging.warning(f"Outcome: Security warning inside why change agreement: {guardrail_warn}")
+        log_structured("WARNING", "security_guardrail", {"node": "process_wc_agreement", "action": "block_wc_agreement", "warning": guardrail_warn})
         state["is_refining"] = True
         state["wc_next_question"] = guardrail_warn
         return to_event("Security warning: Potential injection attempt. Please re-enter your agreement or feedback.")
@@ -782,7 +825,7 @@ Conform your output to the AgreementResponse schema."""
     if data.agreed:
         ctx.route = "agreed"
         state["wc_confirmed"] = True
-        logging.info("Outcome: Why Change Planner agreed successfully. Transitioning to final summary.")
+        log_structured("INFO", "outcome", {"node": "process_wc_agreement", "action": "wc_agreement_success", "route": ctx.route})
         return None
     
     # Handle feedback/edits: route back to why change loop
@@ -793,7 +836,7 @@ Conform your output to the AgreementResponse schema."""
         ctx.route = "agreed"
         state["wc_confirmed"] = True
         force_msg = "We have completed several refinement rounds. Let's lock in this version as our finalized Why Change Planner and prepare the reasoning summary."
-        logging.info("Outcome: Why Change agreement attempts exceeded cap. Forcing confirmation and routing to final summary.")
+        log_structured("INFO", "outcome", {"node": "process_wc_agreement", "action": "wc_agreement_max_attempts_exceeded", "route": ctx.route})
         return to_event(force_msg)
         
     state["is_refining"] = True
@@ -804,7 +847,7 @@ Conform your output to the AgreementResponse schema."""
     state["wc_next_question"] = f"Let's refine the Why Change Planner based on your feedback: '{scrubbed_edits}'. Can you tell me more about this adjustment?"
     
     ctx.route = "disagreed"
-    logging.info(f"Outcome: Disagreed. Routing back to why change loop. Edits: {scrubbed_edits}")
+    log_structured("INFO", "outcome", {"node": "process_wc_agreement", "action": "wc_agreement_disagreed", "edits": scrubbed_edits, "route": ctx.route})
     return to_event("Understood. Let's adjust the Why Change Planner based on your feedback.")
 
 @node
@@ -877,7 +920,7 @@ Your output must be organized around the **ALIGN** discovery stages:
 
 Format the output cleanly using structured subheadings and markdown tables to make it look premium, structured, and professional."""
 
-    logging.info("Intent: Compile ALIGN discovery reasoning summary and Why Change Pitch")
+    log_structured("INFO", "intent", {"node": "reasoning_summary_node", "action": "compile_reasoning_summary"})
     
     response = await asyncio.to_thread(
         client.models.generate_content,
@@ -915,7 +958,7 @@ Thank you for the discovery session. Looking forward to our next meeting!
 [Session Status: Concluded Successfully]"""
 
     summary = redact_pii(raw_summary)
-    logging.info("Outcome: Full Discovery report card compiled, session concluded successfully")
+    log_structured("INFO", "outcome", {"node": "reasoning_summary_node", "action": "summary_compiled", "status": "concluded"})
     return to_event(summary)
 
 # --- Workflow Definition ---
