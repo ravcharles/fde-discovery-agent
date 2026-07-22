@@ -41,6 +41,20 @@ class AgreementResponse(BaseModel):
     agreed: bool = Field(description="True if the customer explicitly agreed (e.g., 'yes', 'looks good', 'correct').")
     edits: str = Field(default="", description="If they disagreed and provided edits/comments, summarize them. Otherwise empty.")
 
+class DiscoveryPromptResponse(BaseModel):
+    customer_confidence: str = Field(description="Assessment of customer's confidence in their answer (e.g., High, Medium, Low).")
+    customer_accuracy: str = Field(description="Assessment of whether they are describing root causes or just symptoms, cause and impact, or justification (e.g., Symptom-focused, Cause-and-Impact, Justification-focused).")
+    finalize: bool = Field(description="True if we have collected sufficient details for Context, Quantify, and Scope to seek customer agreement.")
+    next_question: str = Field(default="", description="If finalize is False, the next discovery question. Otherwise empty.")
+    next_question_type: str = Field(default="", description="If finalize is False, the Question Type classification from page 5 of presentation (e.g. Background, Decisions, Surface-level Problem, Problem Clarity, Problem Scoping, Current Thinking, Solution Implications). Otherwise empty.")
+    next_question_category: str = Field(default="", description="If finalize is False, the Environment Category classification from page 6 of presentation (e.g. Goals, What, Who, When, Where, How Bad, Benefits, Solutions). Otherwise empty.")
+
+class WhyChangePromptResponse(BaseModel):
+    primary_bias: str = Field(description="Identify the primary Status Quo Bias cause from Slide 15: Preference Stability, Cost of Change, Selection Difficulty, Anticipated Regret / Blame.")
+    status_quo_analysis: str = Field(description="Analysis of how to disrupt the identified Status Quo Bias.")
+    finalize: bool = Field(description="True if the planner has sufficient details and we are ready to seek customer agreement.")
+    next_question: str = Field(default="", description="If finalize is False, the next Why Change question. Otherwise empty.")
+
 class WhyChangePlannerDraft(BaseModel):
     target: str = Field(description="Target organization, role, and industry persona.")
     business_goals: str = Field(description="2-3 specific business goals from the customer's perspective.")

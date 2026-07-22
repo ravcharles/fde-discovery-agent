@@ -31,7 +31,9 @@ from app.app_utils.schemas import (
     AgreementResponse,
     WhyChangePlannerDraft,
     WhyChangeLoopResponse,
-    DiscoveryState
+    DiscoveryState,
+    DiscoveryPromptResponse,
+    WhyChangePromptResponse
 )
 
 import asyncio
@@ -80,6 +82,107 @@ def to_event(text: str) -> Event:
         output=content,
         content=content
     )
+
+async def consolidate_discovery_memory(state: dict, history_str: str):
+    """Asynchronously consolidates discovery history into Context, Quantify, Scope draft."""
+    prompt = f"""You are a Google Cloud AI Forward Deployed Engineer (FDE).
+Analyze the following discovery conversation history and refine/compile the structured problem statement draft:
+- Context: (business objectives, current environment, stakeholders, assumptions)
+- Quantify: (risks/blockers, dependencies/constraints, success criteria)
+- Scope: (timelines, technical requirements)
+
+Each section of the draft must be summarized in a few clear, high-impact sentences. Avoid unnecessary filler or boilerplate text.
+
+Discovery History:
+{history_str}
+
+Conform your output to the ProblemStatementDraft schema."""
+
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ProblemStatementDraft,
+                temperature=0.2
+            )
+        )
+        data = ProblemStatementDraft.model_validate_json(response.text)
+        state["draft_context"] = redact_pii(data.context)
+        state["draft_quantify"] = redact_pii(data.quantify)
+        state["draft_scope"] = redact_pii(data.scope)
+        log_structured("INFO", "memory_consolidation_success", {
+            "node": "consolidate_discovery_memory",
+            "draft_context": state["draft_context"],
+            "draft_quantify": state["draft_quantify"],
+            "draft_scope": state["draft_scope"]
+        })
+    except Exception as e:
+        log_structured("ERROR", "memory_consolidation_error", {
+            "node": "consolidate_discovery_memory",
+            "error": str(e)
+        })
+
+async def consolidate_why_change_memory(state: dict, history_str: str, discovery_history_str: str):
+    """Asynchronously consolidates why change history into a Why Change Planner draft."""
+    prompt = f"""You are a Google Cloud AI Forward Deployed Engineer (FDE).
+We are constructing a "Why Change" pitch planner for the customer to defeat status quo bias and highlight unconsidered needs.
+
+Here is the preceding Discovery conversation history:
+{discovery_history_str}
+
+Here is the history of the Why Change discussion:
+{history_str}
+
+Why Change Planner Rubric:
+- **Business Goals**: Starts story in customer's world, 2-3 specific business goals, relates to stakeholder's perspective.
+- **Known Needs vs. Unconsidered Needs**: Explicitly contrasts their recognized/known needs with the unconsidered/unseen problems/opportunities we introduced.
+- **Trends & Changes**: Real but not obvious trends/changes creating business pressure, relates to stakeholders' interests, includes sufficient detail to establish credibility.
+- **Previous Approaches**: Describes previous approach, explains why it no longer works in light of trends/changes, shows how it no longer supports goals.
+- **Consequences**: Uses descriptive language to convey the negative impact of continuing the previous approach (quantified risks/consequences of status quo).
+- **New Way**: Creates an "Aha" moment by contrasting the previous approach with the new way, describes what the customer will be able to do differently using action, DO-level statements, presents the new way without stating solution capabilities or features.
+- **Likely Outcomes**: Cascades values across three tiers:
+  1. Project level: operational efficiency, speed, error reduction.
+  2. Business Unit level: team productivity, collaboration, cost.
+  3. Corporate level: revenue, CSAT, competitive positioning.
+
+Compile/refine the complete Why Change Planner draft. Conform your output to the WhyChangePlannerDraft schema."""
+
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=WhyChangePlannerDraft,
+                temperature=0.2
+            )
+        )
+        data = WhyChangePlannerDraft.model_validate_json(response.text)
+        state["wc_business_goals"] = redact_pii(data.business_goals)
+        state["wc_known_needs"] = redact_pii(data.known_needs)
+        state["wc_unconsidered_needs"] = redact_pii(data.unconsidered_needs)
+        state["wc_trends_changes"] = redact_pii(data.trends_changes)
+        state["wc_previous_approach"] = redact_pii(data.previous_approach)
+        state["wc_consequences"] = redact_pii(data.consequences)
+        state["wc_new_way"] = redact_pii(data.new_way)
+        state["wc_likely_outcomes_project"] = redact_pii(data.likely_outcomes_project)
+        state["wc_likely_outcomes_business_unit"] = redact_pii(data.likely_outcomes_business_unit)
+        state["wc_likely_outcomes_corporate"] = redact_pii(data.likely_outcomes_corporate)
+        state["wc_target"] = redact_pii(data.target)
+        log_structured("INFO", "memory_consolidation_success", {
+            "node": "consolidate_why_change_memory",
+            "target": state["wc_target"],
+            "business_goals": state["wc_business_goals"]
+        })
+    except Exception as e:
+        log_structured("ERROR", "memory_consolidation_error", {
+            "node": "consolidate_why_change_memory",
+            "error": str(e)
+        })
 
 # --- Nodes ---
 
@@ -245,7 +348,13 @@ async def discovery_loop(ctx: Context, node_input: types.Content | str):
     
     questions = state.get("questions_asked", [])
     
-    # Prune history to last 3 turns to optimize token usage
+    # Decouple memory consolidation as a background task using full history
+    full_history = ""
+    for q, a in zip(questions, answers):
+        full_history += f"Q: {q}\nA: {a}\n\n"
+    asyncio.create_task(consolidate_discovery_memory(state, full_history))
+    
+    # Prune history to last 3 turns to optimize conversational prompt token usage
     history_str = ""
     recent_questions = questions[-3:]
     recent_answers = answers[-3:]
@@ -318,14 +427,14 @@ Adhere to these styling instructions for formulation of the next question:
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=DiscoveryResponse,
+            response_schema=DiscoveryPromptResponse,
             temperature=0.2,
             tools=[data_insight_question, why_change_pitch, triple_metric_scaling]
         )
     )
     
     try:
-        data = DiscoveryResponse.model_validate_json(response.text)
+        data = DiscoveryPromptResponse.model_validate_json(response.text)
     except Exception:
         fallback_response = await asyncio.to_thread(
             client.models.generate_content,
@@ -333,11 +442,11 @@ Adhere to these styling instructions for formulation of the next question:
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=DiscoveryResponse,
+                response_schema=DiscoveryPromptResponse,
                 temperature=0.2
             )
         )
-        data = DiscoveryResponse.model_validate_json(fallback_response.text)
+        data = DiscoveryPromptResponse.model_validate_json(fallback_response.text)
     
     # Save assessments
     confidences = state.get("confidence_assessments", [])
@@ -347,11 +456,6 @@ Adhere to these styling instructions for formulation of the next question:
     accuracies = state.get("accuracy_assessments", [])
     accuracies.append(data.customer_accuracy)
     state["accuracy_assessments"] = accuracies
-    
-    # Save refined draft to state (with PII scrubbing)
-    state["draft_context"] = redact_pii(data.refined_draft.context)
-    state["draft_quantify"] = redact_pii(data.refined_draft.quantify)
-    state["draft_scope"] = redact_pii(data.refined_draft.scope)
     
     # Clear refinement override once the user message has been processed
     is_refining = state.get("is_refining", False)
@@ -533,20 +637,35 @@ Generate the initial draft of the Why Change Planner:
 Also, formulate the first targeted question to ask the customer about their previous approach or current setup (status quo) to understand why they want to change. Do not introduce yourself or use welcome greetings (since the conversation is already ongoing and we just aligned on the problem statement). Instead, transition seamlessly using a brief, natural segue (e.g., acknowledging the alignment we just reached and inviting them to explore the underlying trends or setup) before asking the question directly. Keep the tone warm and collaborative.
 Conform to the WhyChangeLoopResponse schema."""
 
+    state["wc_target"] = "TBD"
+    state["wc_business_goals"] = "TBD"
+    state["wc_known_needs"] = "TBD"
+    state["wc_unconsidered_needs"] = "TBD"
+    state["wc_trends_changes"] = "TBD"
+    state["wc_previous_approach"] = "TBD"
+    state["wc_consequences"] = "TBD"
+    state["wc_new_way"] = "TBD"
+    state["wc_likely_outcomes_project"] = "TBD"
+    state["wc_likely_outcomes_business_unit"] = "TBD"
+    state["wc_likely_outcomes_corporate"] = "TBD"
+    
+    # Decouple memory consolidation as a background task using discovery history
+    asyncio.create_task(consolidate_why_change_memory(state, "", discovery_history))
+
     response = await asyncio.to_thread(
         client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=WhyChangeLoopResponse,
+            response_schema=WhyChangePromptResponse,
             temperature=0.2,
             tools=[data_insight_question, why_change_pitch, triple_metric_scaling] # Enable tools
         )
     )
     
     try:
-        data = WhyChangeLoopResponse.model_validate_json(response.text)
+        data = WhyChangePromptResponse.model_validate_json(response.text)
     except Exception:
         fallback_response = await asyncio.to_thread(
             client.models.generate_content,
@@ -554,24 +673,11 @@ Conform to the WhyChangeLoopResponse schema."""
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=WhyChangeLoopResponse,
+                response_schema=WhyChangePromptResponse,
                 temperature=0.2
             )
         )
-        data = WhyChangeLoopResponse.model_validate_json(fallback_response.text)
-    
-    # Save initial planner (with PII scrubbing)
-    state["wc_business_goals"] = redact_pii(data.refined_planner.business_goals)
-    state["wc_known_needs"] = redact_pii(data.refined_planner.known_needs)
-    state["wc_unconsidered_needs"] = redact_pii(data.refined_planner.unconsidered_needs)
-    state["wc_trends_changes"] = redact_pii(data.refined_planner.trends_changes)
-    state["wc_previous_approach"] = redact_pii(data.refined_planner.previous_approach)
-    state["wc_consequences"] = redact_pii(data.refined_planner.consequences)
-    state["wc_new_way"] = redact_pii(data.refined_planner.new_way)
-    state["wc_likely_outcomes_project"] = redact_pii(data.refined_planner.likely_outcomes_project)
-    state["wc_likely_outcomes_business_unit"] = redact_pii(data.refined_planner.likely_outcomes_business_unit)
-    state["wc_likely_outcomes_corporate"] = redact_pii(data.refined_planner.likely_outcomes_corporate)
-    state["wc_target"] = redact_pii(data.refined_planner.target)
+        data = WhyChangePromptResponse.model_validate_json(fallback_response.text)
     
     scrubbed_q = redact_pii(data.next_question)
     state["wc_next_question"] = scrubbed_q
@@ -580,7 +686,6 @@ Conform to the WhyChangeLoopResponse schema."""
     log_structured("INFO", "outcome", {
         "node": "why_change_start_node",
         "action": "why_change_initialized",
-        "target": state["wc_target"],
         "first_question": scrubbed_q,
         "route": ctx.route
     })
@@ -624,7 +729,21 @@ async def why_change_loop(ctx: Context, node_input: types.Content | str):
     questions.append(state.get("wc_next_question", ""))
     state["wc_questions_asked"] = questions
     
-    # Prune history to last 3 turns to optimize token usage
+    # Decouple memory consolidation as a background task using full history
+    full_wc_history = ""
+    for q, a in zip(questions, answers):
+        full_wc_history += f"Q: {q}\nA: {a}\n\n"
+        
+    # Compile Discovery Q&A history
+    discovery_qs = state.get("questions_asked", [])
+    discovery_as = state.get("answers_received", [])
+    discovery_history = ""
+    for q, a in zip(discovery_qs, discovery_as):
+        discovery_history += f"Q: {q}\nA: {a}\n\n"
+        
+    asyncio.create_task(consolidate_why_change_memory(state, full_wc_history, discovery_history))
+    
+    # Prune history to last 3 turns to optimize conversational prompt token usage
     history_str = ""
     recent_questions = questions[-3:]
     recent_answers = answers[-3:]
@@ -700,14 +819,14 @@ Generate response conforming to the WhyChangeLoopResponse schema."""
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=WhyChangeLoopResponse,
+            response_schema=WhyChangePromptResponse,
             temperature=0.2,
             tools=[data_insight_question, why_change_pitch, triple_metric_scaling] # Enable tools
         )
     )
     
     try:
-        data = WhyChangeLoopResponse.model_validate_json(response.text)
+        data = WhyChangePromptResponse.model_validate_json(response.text)
     except Exception:
         fallback_response = await asyncio.to_thread(
             client.models.generate_content,
@@ -715,24 +834,11 @@ Generate response conforming to the WhyChangeLoopResponse schema."""
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=WhyChangeLoopResponse,
+                response_schema=WhyChangePromptResponse,
                 temperature=0.2
             )
         )
-        data = WhyChangeLoopResponse.model_validate_json(fallback_response.text)
-    
-    # Update state (with PII scrubbing)
-    state["wc_business_goals"] = redact_pii(data.refined_planner.business_goals)
-    state["wc_known_needs"] = redact_pii(data.refined_planner.known_needs)
-    state["wc_unconsidered_needs"] = redact_pii(data.refined_planner.unconsidered_needs)
-    state["wc_trends_changes"] = redact_pii(data.refined_planner.trends_changes)
-    state["wc_previous_approach"] = redact_pii(data.refined_planner.previous_approach)
-    state["wc_consequences"] = redact_pii(data.refined_planner.consequences)
-    state["wc_new_way"] = redact_pii(data.refined_planner.new_way)
-    state["wc_likely_outcomes_project"] = redact_pii(data.refined_planner.likely_outcomes_project)
-    state["wc_likely_outcomes_business_unit"] = redact_pii(data.refined_planner.likely_outcomes_business_unit)
-    state["wc_likely_outcomes_corporate"] = redact_pii(data.refined_planner.likely_outcomes_corporate)
-    state["wc_target"] = redact_pii(data.refined_planner.target)
+        data = WhyChangePromptResponse.model_validate_json(fallback_response.text)
     
     biases = state.get("wc_primary_biases", [])
     biases.append(data.primary_bias)
